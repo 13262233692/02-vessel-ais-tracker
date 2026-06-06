@@ -19,27 +19,29 @@ type Config struct {
 }
 
 type Pipeline struct {
-	config     Config
-	ring       *concurrency.LockFreeRingBuffer[*model.VesselData]
-	input      <-chan *model.ParsedMessage
-	output     chan<- []*model.VesselData
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	enqueued   uint64
-	dequeued   uint64
-	dropped    uint64
-	batches    uint64
-	cb         *concurrency.CircuitBreaker
+	config          Config
+	ring            *concurrency.LockFreeRingBuffer[*model.VesselData]
+	input           <-chan *model.ParsedMessage
+	output          chan<- []*model.VesselData
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	enqueued        uint64
+	dequeued        uint64
+	droppedFull     uint64
+	droppedDownstream uint64
+	batches         uint64
+	cb              *concurrency.CircuitBreaker
 }
 
 type PipelineStats struct {
-	Enqueued         uint64
-	Dequeued         uint64
-	Dropped          uint64
-	BatchesFlushed   uint64
+	Enqueued          uint64
+	Dequeued          uint64
+	DroppedFull       uint64
+	DroppedDownstream uint64
+	BatchesFlushed    uint64
 	CurrentQueueDepth int
-	CircuitState     string
+	CircuitState      string
 }
 
 func New(config Config, input <-chan *model.ParsedMessage, output chan<- []*model.VesselData) *Pipeline {
@@ -56,7 +58,7 @@ func New(config Config, input <-chan *model.ParsedMessage, output chan<- []*mode
 		output: output,
 		ctx:    ctx,
 		cancel: cancel,
-		cb:     concurrency.NewCircuitBreaker(10, 5, 5*time.Second),
+		cb:     concurrency.NewCircuitBreaker(50, 10, 3*time.Second),
 	}
 }
 
@@ -81,18 +83,22 @@ func (p *Pipeline) enqueueWorker() {
 				return
 			}
 			if msg.Error != nil || msg.Data == nil {
-				atomic.AddUint64(&p.dropped, 1)
 				continue
 			}
-			if !p.cb.Allow() {
-				atomic.AddUint64(&p.dropped, 1)
-				continue
+
+			queueDepth := p.ring.Len()
+			if queueDepth > p.config.RingBufferSize*9/10 {
+				if !p.cb.Allow() {
+					atomic.AddUint64(&p.droppedFull, 1)
+					continue
+				}
 			}
+
 			if p.ring.Push(msg.Data) {
 				atomic.AddUint64(&p.enqueued, 1)
 				p.cb.Success()
 			} else {
-				atomic.AddUint64(&p.dropped, 1)
+				atomic.AddUint64(&p.droppedFull, 1)
 				p.cb.Failure()
 			}
 		}
@@ -139,7 +145,8 @@ func (p *Pipeline) flushBatch(batch []*model.VesselData) {
 	case p.output <- dataBatch:
 		atomic.AddUint64(&p.dequeued, uint64(count))
 		atomic.AddUint64(&p.batches, 1)
-	case <-p.ctx.Done():
+	default:
+		atomic.AddUint64(&p.droppedDownstream, uint64(count))
 	}
 }
 
@@ -162,6 +169,7 @@ func (p *Pipeline) flushRemaining(batch []*model.VesselData) {
 			atomic.AddUint64(&p.dequeued, uint64(count))
 			atomic.AddUint64(&p.batches, 1)
 		default:
+			atomic.AddUint64(&p.droppedDownstream, uint64(count))
 		}
 	}
 }
@@ -176,12 +184,13 @@ func (p *Pipeline) GetStats() PipelineStats {
 	}
 
 	return PipelineStats{
-		Enqueued:         atomic.LoadUint64(&p.enqueued),
-		Dequeued:         atomic.LoadUint64(&p.dequeued),
-		Dropped:          atomic.LoadUint64(&p.dropped),
-		BatchesFlushed:   atomic.LoadUint64(&p.batches),
+		Enqueued:          atomic.LoadUint64(&p.enqueued),
+		Dequeued:          atomic.LoadUint64(&p.dequeued),
+		DroppedFull:       atomic.LoadUint64(&p.droppedFull),
+		DroppedDownstream: atomic.LoadUint64(&p.droppedDownstream),
+		BatchesFlushed:    atomic.LoadUint64(&p.batches),
 		CurrentQueueDepth: p.ring.Len(),
-		CircuitState:     stateStr,
+		CircuitState:      stateStr,
 	}
 }
 
@@ -192,6 +201,6 @@ func (p *Pipeline) Stop() error {
 }
 
 func (s PipelineStats) String() string {
-	return fmt.Sprintf("Enqueued=%d Dequeued=%d Dropped=%d Batches=%d QueueDepth=%d Circuit=%s",
-		s.Enqueued, s.Dequeued, s.Dropped, s.BatchesFlushed, s.CurrentQueueDepth, s.CircuitState)
+	return fmt.Sprintf("Enqueued=%d Dequeued=%d DropFull=%d DropDown=%d Batches=%d QD=%d CB=%s",
+		s.Enqueued, s.Dequeued, s.DroppedFull, s.DroppedDownstream, s.BatchesFlushed, s.CurrentQueueDepth, s.CircuitState)
 }

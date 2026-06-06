@@ -28,6 +28,7 @@ type Config struct {
 	RetryWait         time.Duration
 	MaxWriteWorkers   int
 	WriteQueueSize    int
+	WriteTimeout      time.Duration
 }
 
 type Storage struct {
@@ -40,9 +41,10 @@ type Storage struct {
 	batchesWritten    uint64
 	recordsWritten    uint64
 	batchesFailed     uint64
+	batchesDropped    uint64
 	lastWriteTime     int64
 	lastWriteDuration int64
-	executor          *concurrency.BoundedExecutor
+	writeCh           chan []*model.VesselData
 	cb                *concurrency.CircuitBreaker
 }
 
@@ -50,10 +52,11 @@ type StorageStats struct {
 	BatchesWritten      uint64
 	RecordsWritten      uint64
 	BatchesFailed       uint64
+	BatchesDropped      uint64
 	LastWriteTime       time.Time
 	LastWriteDuration   time.Duration
+	WriteQueueDepth     int
 	ActiveWorkers       int
-	PendingBatches      int
 	CircuitState        string
 }
 
@@ -64,16 +67,19 @@ func New(config Config, input <-chan []*model.VesselData) *Storage {
 		config.MaxWriteWorkers = 4
 	}
 	if config.WriteQueueSize <= 0 {
-		config.WriteQueueSize = 100
+		config.WriteQueueSize = 200
+	}
+	if config.WriteTimeout <= 0 {
+		config.WriteTimeout = 5 * time.Second
 	}
 
 	return &Storage{
-		config:   config,
-		input:    input,
-		ctx:      ctx,
-		cancel:   cancel,
-		executor: concurrency.NewBoundedExecutor(ctx, config.MaxWriteWorkers),
-		cb:       concurrency.NewCircuitBreaker(20, 10, 10*time.Second),
+		config:  config,
+		input:   input,
+		ctx:     ctx,
+		cancel:  cancel,
+		writeCh: make(chan []*model.VesselData, config.WriteQueueSize),
+		cb:      concurrency.NewCircuitBreaker(50, 20, 15*time.Second),
 	}
 }
 
@@ -100,21 +106,24 @@ func (s *Storage) Connect() error {
 }
 
 func (s *Storage) Start() {
+	for i := 0; i < s.config.MaxWriteWorkers; i++ {
+		s.wg.Add(1)
+		go s.writeWorker(i)
+	}
 	s.wg.Add(1)
 	go s.dispatchWorker()
 }
 
 func (s *Storage) dispatchWorker() {
 	defer s.wg.Done()
+	defer close(s.writeCh)
 
 	for {
 		select {
 		case <-s.ctx.Done():
-			s.executor.Stop()
 			return
 		case batch, ok := <-s.input:
 			if !ok {
-				s.executor.Stop()
 				return
 			}
 			if len(batch) == 0 {
@@ -122,20 +131,25 @@ func (s *Storage) dispatchWorker() {
 			}
 
 			if !s.cb.Allow() {
-				atomic.AddUint64(&s.batchesFailed, 1)
+				atomic.AddUint64(&s.batchesDropped, 1)
 				continue
 			}
 
-			batchCopy := batch
-			submitted := s.executor.Execute(func() {
-				s.writeBatchWithRetry(batchCopy)
-			})
-
-			if !submitted {
-				atomic.AddUint64(&s.batchesFailed, 1)
+			select {
+			case s.writeCh <- batch:
+			default:
+				atomic.AddUint64(&s.batchesDropped, 1)
 				s.cb.Failure()
 			}
 		}
+	}
+}
+
+func (s *Storage) writeWorker(id int) {
+	defer s.wg.Done()
+
+	for batch := range s.writeCh {
+		s.writeBatchWithRetry(batch)
 	}
 }
 
@@ -148,7 +162,11 @@ func (s *Storage) writeBatchWithRetry(batch []*model.VesselData) {
 			return
 		}
 
-		if err := s.writeBatchCopyIn(batch); err != nil {
+		writeCtx, cancel := context.WithTimeout(s.ctx, s.config.WriteTimeout)
+		err := s.writeBatchCopyIn(writeCtx, batch)
+		cancel()
+
+		if err != nil {
 			lastErr = err
 			time.Sleep(s.config.RetryWait)
 			continue
@@ -168,14 +186,14 @@ func (s *Storage) writeBatchWithRetry(batch []*model.VesselData) {
 	_ = lastErr
 }
 
-func (s *Storage) writeBatchCopyIn(batch []*model.VesselData) error {
-	txn, err := s.db.BeginTx(s.ctx, &sql.TxOptions{})
+func (s *Storage) writeBatchCopyIn(ctx context.Context, batch []*model.VesselData) error {
+	txn, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer txn.Rollback()
 
-	stmt, err := txn.PrepareContext(s.ctx, pq.CopyIn(
+	stmt, err := txn.PrepareContext(ctx, pq.CopyIn(
 		"vessel_positions",
 		"time", "mmsi", "latitude", "longitude", "cog", "sog", "message_type",
 	))
@@ -185,7 +203,12 @@ func (s *Storage) writeBatchCopyIn(batch []*model.VesselData) error {
 	defer stmt.Close()
 
 	for _, data := range batch {
-		_, err := stmt.ExecContext(s.ctx,
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		_, err := stmt.ExecContext(ctx,
 			data.Timestamp,
 			data.MMSI,
 			data.Latitude,
@@ -199,51 +222,12 @@ func (s *Storage) writeBatchCopyIn(batch []*model.VesselData) error {
 		}
 	}
 
-	if _, err := stmt.ExecContext(s.ctx); err != nil {
+	if _, err := stmt.ExecContext(ctx); err != nil {
 		return fmt.Errorf("copy finish: %w", err)
 	}
 
 	if err := txn.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
-	}
-
-	return nil
-}
-
-func (s *Storage) writeBatch(batch []*model.VesselData) error {
-	tx, err := s.db.BeginTx(s.ctx, &sql.TxOptions{})
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.PrepareContext(s.ctx, `
-		INSERT INTO vessel_positions (
-			time, mmsi, latitude, longitude, cog, sog, message_type
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`)
-	if err != nil {
-		return fmt.Errorf("prepare stmt: %w", err)
-	}
-	defer stmt.Close()
-
-	for _, data := range batch {
-		_, err := stmt.ExecContext(s.ctx,
-			data.Timestamp,
-			data.MMSI,
-			data.Latitude,
-			data.Longitude,
-			data.COG,
-			data.SOG,
-			data.MessageType,
-		)
-		if err != nil {
-			return fmt.Errorf("exec stmt: %w", err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
 	}
 
 	return nil
@@ -262,10 +246,11 @@ func (s *Storage) GetStats() StorageStats {
 		BatchesWritten:    atomic.LoadUint64(&s.batchesWritten),
 		RecordsWritten:    atomic.LoadUint64(&s.recordsWritten),
 		BatchesFailed:     atomic.LoadUint64(&s.batchesFailed),
+		BatchesDropped:    atomic.LoadUint64(&s.batchesDropped),
 		LastWriteTime:     time.Unix(0, atomic.LoadInt64(&s.lastWriteTime)),
 		LastWriteDuration: time.Duration(atomic.LoadInt64(&s.lastWriteDuration)),
-		ActiveWorkers:     s.executor.MaxConcurrency() - s.executor.AvailablePermits(),
-		PendingBatches:    len(s.input),
+		WriteQueueDepth:   len(s.writeCh),
+		ActiveWorkers:     s.config.MaxWriteWorkers,
 		CircuitState:      stateStr,
 	}
 }

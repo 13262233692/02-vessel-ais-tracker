@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vessel-ais-tracker/internal/model"
@@ -16,20 +17,23 @@ type Config struct {
 }
 
 type Parser struct {
-	config  Config
-	input   <-chan *model.AISMessage
-	output  chan<- *model.ParsedMessage
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	stats   ParserStats
-	statsMu sync.RWMutex
+	config         Config
+	input          <-chan *model.AISMessage
+	output         chan<- *model.ParsedMessage
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	messagesParsed uint64
+	messagesFailed uint64
+	messagesDropped uint64
+	lastParseTime  int64
 }
 
 type ParserStats struct {
-	MessagesParsed uint64
-	MessagesFailed uint64
-	LastParseTime  time.Time
+	MessagesParsed  uint64
+	MessagesFailed  uint64
+	MessagesDropped uint64
+	LastParseTime   time.Time
 }
 
 const (
@@ -79,16 +83,19 @@ func (p *Parser) parseMessage(msg *model.AISMessage) {
 	data, err := p.parseNMEA(msg.Raw)
 	if err != nil {
 		parsed.Error = err
-		p.incrementFailed()
-	} else {
-		parsed.Data = data
-		data.Timestamp = msg.Timestamp
-		p.incrementParsed()
+		atomic.AddUint64(&p.messagesFailed, 1)
+		return
 	}
+
+	parsed.Data = data
+	data.Timestamp = msg.Timestamp
+	atomic.AddUint64(&p.messagesParsed, 1)
+	atomic.StoreInt64(&p.lastParseTime, time.Now().UTC().UnixNano())
 
 	select {
 	case p.output <- parsed:
-	case <-p.ctx.Done():
+	default:
+		atomic.AddUint64(&p.messagesDropped, 1)
 	}
 }
 
@@ -203,23 +210,13 @@ func (p *Parser) decodePositionReport(bits []byte) (*model.VesselData, error) {
 	}, nil
 }
 
-func (p *Parser) incrementParsed() {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	p.stats.MessagesParsed++
-	p.stats.LastParseTime = time.Now().UTC()
-}
-
-func (p *Parser) incrementFailed() {
-	p.statsMu.Lock()
-	defer p.statsMu.Unlock()
-	p.stats.MessagesFailed++
-}
-
 func (p *Parser) GetStats() ParserStats {
-	p.statsMu.RLock()
-	defer p.statsMu.RUnlock()
-	return p.stats
+	return ParserStats{
+		MessagesParsed:  atomic.LoadUint64(&p.messagesParsed),
+		MessagesFailed:  atomic.LoadUint64(&p.messagesFailed),
+		MessagesDropped: atomic.LoadUint64(&p.messagesDropped),
+		LastParseTime:   time.Unix(0, atomic.LoadInt64(&p.lastParseTime)),
+	}
 }
 
 func (p *Parser) Stop() {

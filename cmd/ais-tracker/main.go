@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -15,12 +16,16 @@ import (
 	"github.com/vessel-ais-tracker/internal/storage"
 )
 
+const (
+	maxGoroutinesThreshold = 5000
+)
+
 func main() {
 	cfg := config.Default()
 
-	rawMsgChan := make(chan *model.AISMessage, 10000)
-	parsedMsgChan := make(chan *model.ParsedMessage, 10000)
-	batchChan := make(chan []*model.VesselData, 100)
+	rawMsgChan := make(chan *model.AISMessage, 50000)
+	parsedMsgChan := make(chan *model.ParsedMessage, 50000)
+	batchChan := make(chan []*model.VesselData, 200)
 
 	lis := listener.New(cfg.Listener, rawMsgChan)
 	par := parser.New(cfg.Parser, rawMsgChan, parsedMsgChan)
@@ -28,6 +33,7 @@ func main() {
 	store := storage.New(cfg.Storage, batchChan)
 
 	log.Println("Starting AIS Tracker Service...")
+	log.Printf("Max goroutine threshold: %d", maxGoroutinesThreshold)
 
 	if err := lis.Start(); err != nil {
 		log.Fatalf("Failed to start listener: %v", err)
@@ -76,15 +82,23 @@ func statsReporter(lis *listener.Listener, par *parser.Parser, pipe *pipeline.Pi
 		parStats := par.GetStats()
 		pipeStats := pipe.GetStats()
 		storeStats := store.GetStats()
+		goroutines := runtime.NumGoroutine()
 
-		log.Printf("STATS - Listener: pkts=%d bytes=%d errs=%d | "+
-			"Parser: parsed=%d failed=%d | "+
+		goroutineWarn := ""
+		if goroutines > maxGoroutinesThreshold {
+			goroutineWarn = " ⚠️ HIGH GOROUTINE COUNT!"
+		}
+
+		log.Printf("STATS [goroutines=%d%s] | "+
+			"Listener: pkts=%d bytes=%d errs=%d | "+
+			"Parser: parsed=%d failed=%d dropped=%d | "+
 			"Pipeline: %s | "+
-			"Storage: batches=%d records=%d failed=%d workers=%d pending=%d circuit=%s",
+			"Storage: written=%d records=%d failed=%d dropped=%d writeQ=%d cb=%s",
+			goroutines, goroutineWarn,
 			lisStats.PacketsReceived, lisStats.BytesReceived, lisStats.Errors,
-			parStats.MessagesParsed, parStats.MessagesFailed,
+			parStats.MessagesParsed, parStats.MessagesFailed, parStats.MessagesDropped,
 			pipeStats.String(),
 			storeStats.BatchesWritten, storeStats.RecordsWritten, storeStats.BatchesFailed,
-			storeStats.ActiveWorkers, storeStats.PendingBatches, storeStats.CircuitState)
+			storeStats.BatchesDropped, storeStats.WriteQueueDepth, storeStats.CircuitState)
 	}
 }

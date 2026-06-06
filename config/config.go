@@ -45,7 +45,8 @@ func Default() Config {
 			RetryCount:      3,
 			RetryWait:       100 * time.Millisecond,
 			MaxWriteWorkers: 4,
-			WriteQueueSize:  100,
+			WriteQueueSize:  200,
+			WriteTimeout:    5 * time.Second,
 		},
 	}
 }
