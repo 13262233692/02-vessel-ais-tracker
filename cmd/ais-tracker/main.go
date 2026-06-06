@@ -9,11 +9,13 @@ import (
 	"time"
 
 	"github.com/vessel-ais-tracker/config"
+	"github.com/vessel-ais-tracker/internal/geofence"
 	"github.com/vessel-ais-tracker/internal/listener"
 	"github.com/vessel-ais-tracker/internal/model"
 	"github.com/vessel-ais-tracker/internal/parser"
 	"github.com/vessel-ais-tracker/internal/pipeline"
 	"github.com/vessel-ais-tracker/internal/storage"
+	"github.com/vessel-ais-tracker/internal/warning"
 )
 
 const (
@@ -57,7 +59,33 @@ func main() {
 		log.Println("Storage started")
 	}
 
-	go statsReporter(lis, par, pipe, store)
+	var warnPipe *warning.WarningPipeline
+	var logPublisher *warning.LogPublisher
+	var redisPublisher *warning.RedisPublisher
+
+	if cfg.Warning.Enabled {
+		fenceMgr := geofence.NewManager()
+		warning.LoadSampleFences(fenceMgr)
+		log.Printf("Geofence manager loaded with %d zones", fenceMgr.FenceCount())
+
+		warningInput := warning.TapInto(parsedMsgChan, cfg.Warning.InputQueueSize)
+
+		warnPipe = warning.New(warning.Config{
+			WorkerCount:    cfg.Warning.WorkerCount,
+			InputQueueSize: cfg.Warning.InputQueueSize,
+			AlertQueueSize: cfg.Warning.AlertQueueSize,
+		}, warningInput, fenceMgr)
+		warnPipe.Start()
+		log.Printf("Warning pipeline started with %d workers", cfg.Warning.WorkerCount)
+
+		logPublisher = warning.NewLogPublisher(warnPipe.AlertChannel())
+		logPublisher.Start()
+		log.Println("Alert log publisher started")
+
+		_ = redisPublisher
+	}
+
+	go statsReporter(lis, par, pipe, store, warnPipe)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -70,10 +98,23 @@ func main() {
 	pipe.Stop()
 	store.Stop()
 
+	if warnPipe != nil {
+		warnPipe.Stop()
+	}
+	if logPublisher != nil {
+		logPublisher.Stop()
+	}
+
 	log.Println("Shutdown complete")
 }
 
-func statsReporter(lis *listener.Listener, par *parser.Parser, pipe *pipeline.Pipeline, store *storage.Storage) {
+func statsReporter(
+	lis *listener.Listener,
+	par *parser.Parser,
+	pipe *pipeline.Pipeline,
+	store *storage.Storage,
+	warn *warning.WarningPipeline,
+) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -89,16 +130,23 @@ func statsReporter(lis *listener.Listener, par *parser.Parser, pipe *pipeline.Pi
 			goroutineWarn = " ⚠️ HIGH GOROUTINE COUNT!"
 		}
 
+		warnStatsStr := ""
+		if warn != nil {
+			warnStats := warn.GetStats()
+			warnStatsStr = " | Warning: " + warnStats.String()
+		}
+
 		log.Printf("STATS [goroutines=%d%s] | "+
 			"Listener: pkts=%d bytes=%d errs=%d | "+
 			"Parser: parsed=%d failed=%d dropped=%d | "+
 			"Pipeline: %s | "+
-			"Storage: written=%d records=%d failed=%d dropped=%d writeQ=%d cb=%s",
+			"Storage: written=%d records=%d failed=%d dropped=%d writeQ=%d cb=%s%s",
 			goroutines, goroutineWarn,
 			lisStats.PacketsReceived, lisStats.BytesReceived, lisStats.Errors,
 			parStats.MessagesParsed, parStats.MessagesFailed, parStats.MessagesDropped,
 			pipeStats.String(),
 			storeStats.BatchesWritten, storeStats.RecordsWritten, storeStats.BatchesFailed,
-			storeStats.BatchesDropped, storeStats.WriteQueueDepth, storeStats.CircuitState)
+			storeStats.BatchesDropped, storeStats.WriteQueueDepth, storeStats.CircuitState,
+			warnStatsStr)
 	}
 }
